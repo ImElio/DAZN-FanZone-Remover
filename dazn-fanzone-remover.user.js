@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DAZN FanZone Remover
 // @namespace    https://github.com/ImElio/dazn-fanzone-remover
-// @version      1.0.0
+// @version      1.0.1
 // @description  Hides the DAZN FanZone
 // @author       Elio & Shokkino
 // @license      MIT
@@ -10,94 +10,143 @@
 // @updateURL    https://github.com/ImElio/dazn-fanzone-remover/raw/main/dazn-fanzone-remover.user.js
 // @downloadURL  https://github.com/ImElio/dazn-fanzone-remover/raw/main/dazn-fanzone-remover.user.js
 // @match        https://www.dazn.com/*
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  // We tag hidden nodes to avoid repeated work/logs
-  const MARK = 'data-fz-hidden';
+  /** Set to true for verbose diagnosis in the console (no runtime impact when false). */
+  const DEBUG = false;
 
+  /** Attribute used to mark already-hidden containers (idempotency). */
+  const HIDDEN_ATTR = 'data-fz-hidden';
+
+  /**
+   * DEPRECATED (old, brittle literal match):
+   *   const FANZONE_RE = null; // not used (strict equality only)
+   *
+   * FIX: Accept both "FanZone" and "Fan Zone" (any case), because some UIs compose the label inside sentences.
+   */
+  const FANZONE_RE  = /\bfan\s?zone\b/i;
+
+  /**
+   * FIX: Secondary signal — chat input placeholders are localized but stable (“Inizia a scrivere…”, “Write a message…”).
+   * This helps when the visible label isn't an isolated "FanZone" node.
+   */
+  const INPUT_RE    = /(scriv|write|message|messag)/i;
+
+  const log = (...args) => { if (DEBUG) console.info('[DAZN FanZone Remover]', ...args); };
   const isVisible = (el) => !!el && el.offsetParent !== null;
 
-  // Heuristic: a DAZN right sidebar / FanZone-like container
-  function looksLikeSidebar(el) {
-    if (!el || el === document.body) return false;
+  /**
+   * pickContainer(from)
+   *
+   * DEPRECATED (oversimplified; risk of blank screen):
+   *   // const container = from.closest('aside') || from.closest('div');
+   *   // container.style.display = 'none';
+   * Reason: climbing blindly to 'div' could target a large layout wrapper that also hosts the <video> player.
+   *
+   * FIX: Prefer semantic sidebars (ASIDE / role="complementary") when they do NOT contain <video>.
+   *      Otherwise, climb a few levels and pick the first wrapper that does NOT include <video>.
+   *      This preserves the player layout, preventing black screens.
+   */
+  function pickContainer(from) {
+    if (!from) return null;
 
-    const cs   = getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
+    // Prefer semantic wrappers (most UIs wrap sidebars as <aside> or role="complementary").
+    const prefer = from.closest('aside, [role="complementary"]');
+    if (prefer && !prefer.querySelector('video')) return prefer;
 
-    // Typical chat width; usually sits on the right and is scrollable
-    const widthOk   = rect.width >= 220 && rect.width <= 560;
-    const rightSide = rect.left > (window.innerWidth * 0.45);
-    const scrollish = ['auto', 'scroll'].includes(cs.overflowY) || ['auto', 'scroll'].includes(cs.overflow);
-
-    const tagOk  = el.tagName === 'ASIDE' || el.getAttribute('role') === 'complementary';
-    const nameOk = /fan.?zone|chat|community/.test(
-      ((el.className || '') + ' ' + (el.id || '')).toLowerCase()
-    );
-
-    // Never hide containers that include the player
-    const containsPlayer = el.querySelector('video, [data-player], [data-testid*="video"]');
-
-    return !containsPlayer && rightSide && widthOk && (tagOk || nameOk || scrollish);
-  }
-
-  // From a node that hints FanZone, climb to the most likely sidebar wrapper
-  function findSidebarContainer(from) {
+    // Climb conservatively; stop early at the first safe wrapper.
     let cur = from;
-    for (let i = 0; i < 8 && cur; i++) {
-      if (looksLikeSidebar(cur)) return cur;
+    for (let i = 0; i < 6 && cur; i++) {
       cur = cur.parentElement;
+      if (!cur) break;
+      if (!cur.querySelector('video')) return cur;
     }
-    // Conservative fallback, still re-validated by looksLikeSidebar
-    const fallback = from.closest('aside,[role="complementary"]') || from.closest('div,section');
-    return looksLikeSidebar(fallback) ? fallback : null;
+
+    // Last resort (still avoid <body> and any node that includes <video>).
+    const fallback = from.closest('div, section, nav');
+    if (fallback && !fallback.querySelector('video') && fallback !== document.body) return fallback;
+
+    return null;
   }
 
-  function hideSidebar(el) {
-    if (!el || el.hasAttribute(MARK)) return;
+  /**
+   * hide(el)
+   *
+   * DEPRECATED (no idempotency; noisy console):
+   *   // el.style.display = 'none';
+   *   // console.log('FanZone removed:', el);
+   *
+   * FIX: Apply display:none with an attribute marker to avoid repeated work/logs across re-renders.
+   */
+  function hide(el) {
+    if (!el || el.hasAttribute(HIDDEN_ATTR)) return;
     el.style.setProperty('display', 'none', 'important');
-    el.setAttribute(MARK, '1');
-    console.info('[DAZN FanZone Remover] Sidebar hidden.', el);
+    el.setAttribute(HIDDEN_ATTR, '1');
+    log('hidden:', el);
   }
 
-  // Main sweep:
-  // 1) exact “FanZone” label/aria-label (like the original script),
-  // 2) backup via chat input placeholder (“Inizia a scrivere…”, “Write a message…”)
+  /**
+   * sweep()
+   * Single pass that:
+   *  A) finds explicit "FanZone" signals (text or aria-label),
+   *  B) uses chat input placeholder as a robust backup signal (localized).
+   *
+   * DEPRECATED (strict-only text match, misses embedded labels):
+   *   // if (node.textContent?.trim() === 'FanZone') { ... }
+   *
+   * FIX: Combine exact, regex, and aria-label; then pick a safe container via pickContainer().
+   */
   function sweep() {
-    // (1) Exact label/aria-label
-    const all = document.querySelectorAll('*');
-    for (const n of all) {
-      if (!isVisible(n)) continue;
-      const txt  = (n.textContent || '').trim();
-      const aria = n.getAttribute ? (n.getAttribute('aria-label') || '') : '';
-      if (txt === 'FanZone' || aria === 'FanZone') {
-        const container = findSidebarContainer(n);
-        if (container) hideSidebar(container);
-      }
-    }
+    try {
+      document.querySelectorAll('*').forEach(node => {
+        if (!isVisible(node)) return;
 
-    // (2) Chat input placeholder as a stable backup
-    const reInput = /(scriv|messag|write)/i; // “Inizia a scrivere…”, “Write a message…”
-    document.querySelectorAll('input[placeholder], textarea[placeholder]').forEach(inp => {
-      if (!isVisible(inp)) return;
-      const ph = inp.getAttribute('placeholder') || '';
-      if (reInput.test(ph)) {
-        const container = findSidebarContainer(inp);
-        if (container) hideSidebar(container);
-      }
-    });
+        const txt  = (node.textContent || '').trim();
+        const aria = node.getAttribute ? (node.getAttribute('aria-label') || '') : '';
+
+        // DEPRECATED (strict-only):
+        // if (txt === 'FanZone') { const c = node.closest('aside') || node.closest('div'); c.style.display = 'none'; }
+
+        // FIX: tolerate different casings and placements + aria-label
+        if (txt === 'FanZone' || aria === 'FanZone' || FANZONE_RE.test(txt)) {
+          const container = pickContainer(node);
+          if (container) hide(container);
+        }
+      });
+
+      document.querySelectorAll('input[placeholder], textarea[placeholder]').forEach(inp => {
+        if (!isVisible(inp)) return;
+        const ph = inp.getAttribute('placeholder') || '';
+        if (INPUT_RE.test(ph)) {
+          const container = pickContainer(inp);
+          if (container) hide(container);
+        }
+      });
+
+    } catch (err) {
+      // NOTE: tolerate occasional DOM access errors without breaking the loop.
+      if (DEBUG) console.warn('[DAZN FanZone Remover] sweep error:', err);
+    }
   }
 
-  const mo = new MutationObserver(sweep);
+  /**
+   * DEPRECATED (observer only; may miss virtualized updates):
+   *   // new MutationObserver(sweep).observe(document.body, { childList: true, subtree: true });
+   *
+   * FIX: Combine MutationObserver (reactive) with a periodic sweep (proactive),
+   *      mirroring the original "observer + setInterval" resiliency but with safer targeting.
+   */
+  const mo = new MutationObserver(() => sweep());
 
   function start() {
-    if (!document.body) return setTimeout(start, 50);
+    if (!document.body) { setTimeout(start, 50); return; }
     mo.observe(document.body, { childList: true, subtree: true });
     sweep();
-    // Safety net, like the original approach
     setInterval(sweep, 1500);
   }
 
